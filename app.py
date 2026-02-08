@@ -9,19 +9,19 @@ from matplotlib.path import Path
 from matplotlib.patches import PathPatch
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="NYT Snow Map Replication", layout="wide")
+st.set_page_config(page_title="NYT Snow Map", layout="wide")
 
 # --- 1. Load Data (Cached) ---
 @st.cache_data
 def load_data():
-    # NOTE: Ensure this file is uploaded to your GitHub repository!
+    # Make sure this matches your Excel filename exactly
     file_path = 'Christmas_day_snow_statistics_1991-2020_updated.xlsx'
     
+    # Try loading with error handling
     try:
         df = pd.read_excel(file_path, header=6)
-    except Exception as e:
-        st.error(f"Error loading file: {e}. Make sure the .xlsx file is in the GitHub repo.")
-        return pd.DataFrame()
+    except:
+        return pd.DataFrame() # Return empty if failed
 
     # Clean Columns
     prob_col = [c for c in df.columns if 'Probability' in c][0]
@@ -49,19 +49,15 @@ def load_map():
 
 gdf = load_map()
 
-# --- 3. Sidebar Interactivity ---
-st.sidebar.header("Map Controls")
-min_prob = st.sidebar.slider("Highlight Areas with Probability > X%", 0, 100, 0)
+# --- 3. Streamlit Interface ---
+# WE USE STREAMLIT NATIVE TITLE HERE (Better than Matplotlib text)
+st.title("Historic Probability of a White Christmas")
+st.markdown("**Source:** NOAA 1991-2020 Climate Normals | **Replication:** New York Times Style")
 
-# Filter data based on slider (optional visual interaction)
-# For the main heatmap, we use all data, but we can display stats
-filtered_stations = df[df['prob_snow'] >= min_prob]
-st.sidebar.write(f"Stations matching criteria: {len(filtered_stations)}")
+# Interactive Slider
+min_prob = st.sidebar.slider("Filter: Show Areas with Probability > X%", 0, 100, 0)
 
 # --- 4. Plotting Logic ---
-st.title("Historic Probability of White Christmas")
-st.markdown("Replicating the New York Times visualization style.")
-
 if not df.empty:
     # Interpolation Grid
     x_min, x_max = -126, -66
@@ -77,19 +73,16 @@ if not df.empty:
     # Linear interpolation
     grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
 
-    # Create Plot
-    fig, ax = plt.subplots(figsize=(20, 12))
+    # Create Plot - Larger Figure for Clarity
+    fig, ax = plt.subplots(figsize=(15, 10))
     
-    # Define Levels and Colors (NYT Style)
+    # NYT Color Levels
     levels = [0, 10, 25, 40, 50, 60, 75, 90, 100]
     color_list = [
         '#ffffff', '#e0e0e0', '#cccccc', '#99ccff', '#66b2ff', 
         '#3399ff', '#0080ff', '#0066cc', '#004c99'
     ]
-    # Ensure color list matches level intervals (N levels - 1 colors needed, or N for boundary norm)
-    # Adjusted to match your previous specific hex codes if preferred, 
-    # but strictly mapping to the logic:
-    cmap = mcolors.LinearSegmentedColormap.from_list("", color_list)
+    cmap = mcolors.ListedColormap(color_list)
     norm = mcolors.BoundaryNorm(levels, cmap.N)
 
     # Plot Contour
@@ -97,8 +90,6 @@ if not df.empty:
 
     # Clip to US Borders
     usa_boundary = gdf.dissolve().geometry.iloc[0]
-    
-    # Path Patch logic
     path = Path.make_compound_path(*[
         Path(np.array(poly.exterior.coords))
         for poly in (usa_boundary.geoms if hasattr(usa_boundary, 'geoms') else [usa_boundary])
@@ -107,9 +98,9 @@ if not df.empty:
     contour.set_clip_path(patch)
 
     # Draw State Borders
-    gdf.boundary.plot(ax=ax, color='white', linewidth=0.8, alpha=0.5)
+    gdf.boundary.plot(ax=ax, color='white', linewidth=0.5, alpha=0.5)
 
-    # State Labels
+    # State Labels (Optimized for Streamlit)
     state_map = {
         'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
         'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'Florida': 'FL', 'Georgia': 'GA',
@@ -128,13 +119,18 @@ if not df.empty:
         if pd.notnull(row['short_name']):
             centroid = row.geometry.representative_point()
             ax.annotate(text=row['short_name'], xy=(centroid.x, centroid.y),
-                        ha='center', va='center', color='black', fontsize=8, weight='bold')
+                        ha='center', va='center', color='black', fontsize=6, weight='bold')
 
     # Remove Axes
     ax.axis('off')
+
+    # FIXED COLORBAR: We attach it to the bottom of the map
+    cbar = fig.colorbar(contour, ax=ax, orientation='horizontal', fraction=0.035, pad=0.04)
+    cbar.set_label('Probability (%)', size=10)
+    cbar.ax.tick_params(labelsize=8)
 
     # Render in Streamlit
     st.pyplot(fig)
 
 else:
-    st.warning("Data not loaded. Please ensure the Excel file is in the repository.")
+    st.error("Data could not be loaded. Please check the 'Christmas_day_snow_statistics_1991-2020_updated.xlsx' file in GitHub.")
