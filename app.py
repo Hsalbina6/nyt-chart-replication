@@ -54,7 +54,6 @@ def load_states() -> gpd.GeoDataFrame:
 
 @st.cache_data
 def precompute_grid(df: pd.DataFrame, nx: int, ny: int):
-    # bbox
     x_min, x_max = -126, -66
     y_min, y_max = 24, 50
 
@@ -67,10 +66,10 @@ def precompute_grid(df: pd.DataFrame, nx: int, ny: int):
     values = df['prob_snow'].values
 
     grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
-    return (x_min, x_max, y_min, y_max, grid_x, grid_y, grid_z, points, values)
+    return x_min, x_max, y_min, y_max, grid_x, grid_y, grid_z, points, values
 
 
-def build_base_figure(gdf: gpd.GeoDataFrame, grid_x, grid_y, grid_z, x_min, x_max, y_min, y_max):
+def build_base_figure(gdf: gpd.GeoDataFrame, grid_x, grid_y, grid_z):
     fig, ax = plt.subplots(figsize=(20, 12))
     plt.subplots_adjust(top=0.85)
 
@@ -92,13 +91,13 @@ def build_base_figure(gdf: gpd.GeoDataFrame, grid_x, grid_y, grid_z, x_min, x_ma
     usa_boundary = gdf.dissolve().geometry.iloc[0]
     polys = usa_boundary.geoms if hasattr(usa_boundary, 'geoms') else [usa_boundary]
     path = Path.make_compound_path(*[Path(np.array(poly.exterior.coords)) for poly in polys])
-    patch = PathPatch(path, transform=ax.transData, facecolor='none')
-    contour.set_clip_path(patch)
+    clip_patch = PathPatch(path, transform=ax.transData, facecolor='none')
+    contour.set_clip_path(clip_patch)
 
-    # state lines
+    # Draw State Lines
     gdf.boundary.plot(ax=ax, color='black', linewidth=0.8, alpha=0.6, zorder=4)
 
-    # labels
+    # Labels
     state_map = {
         'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
         'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'Florida': 'FL', 'Georgia': 'GA',
@@ -113,6 +112,7 @@ def build_base_figure(gdf: gpd.GeoDataFrame, grid_x, grid_y, grid_z, x_min, x_ma
     }
     gdf2 = gdf.copy()
     gdf2['short_name'] = gdf2['name'].map(state_map)
+
     for _, row in gdf2.iterrows():
         if pd.notnull(row['short_name']):
             p = row.geometry.representative_point()
@@ -141,24 +141,21 @@ def build_base_figure(gdf: gpd.GeoDataFrame, grid_x, grid_y, grid_z, x_min, x_ma
     )
 
     cbar_ax = fig.add_axes([0.25, 0.88, 0.5, 0.02])
-    cbar = fig.colorbar(contour, cax=cbar_ax, orientation='horizontal', ticks=levels)
+    cbar = fig.colorbar(contour, cax=cbar_ax, orientation='horizontal',
+                        ticks=[0, 10, 25, 40, 50, 60, 75, 90, 100])
     cbar.ax.tick_params(labelsize=10)
 
-    return fig, ax, patch
+    return fig, ax, clip_patch, contour
 
 
 def generate_weighted_flakes(points, values, x_min, x_max, y_min, y_max, n_flakes, seed):
-    """
-    Create initial flake positions weighted by probability.
-    """
     rng = np.random.default_rng(seed)
-    candidates = int(n_flakes * 6)
+    candidates = max(int(n_flakes * 6), n_flakes)
 
     xs = rng.uniform(x_min, x_max, size=candidates)
     ys = rng.uniform(y_min, y_max, size=candidates)
 
     probs = griddata(points, values, (xs, ys), method='linear')
-
     nan_mask = np.isnan(probs)
     if np.any(nan_mask):
         probs[nan_mask] = griddata(points, values, (xs[nan_mask], ys[nan_mask]), method='nearest')
@@ -169,16 +166,12 @@ def generate_weighted_flakes(points, values, x_min, x_max, y_min, y_max, n_flake
     fx = xs[keep]
     fy = ys[keep]
 
-    # cap to n_flakes
     if fx.size > n_flakes:
         idx = rng.choice(fx.size, size=n_flakes, replace=False)
         fx, fy = fx[idx], fy[idx]
 
-    # sizes + speed per flake (bigger flakes fall faster)
     sizes = rng.uniform(3, 18, size=fx.size)
-    speed = rng.uniform(0.03, 0.12, size=fx.size) * (sizes / sizes.max())
-
-    # alpha per flake
+    speed = rng.uniform(0.06, 0.20, size=fx.size) * (sizes / sizes.max())  # faster than before
     alphas = rng.uniform(0.15, 0.60, size=fx.size)
 
     return fx, fy, sizes, speed, alphas
@@ -202,11 +195,12 @@ with st.sidebar:
     else:
         nx, ny = 1000, 600
 
-    st.header("Animated snow")
+    st.header("Animated snow (A2)")
     snow_on = st.checkbox("Enable animation", value=True)
     snow_density = st.slider("Snow density", 0, 2000, 700, step=50)
     fps = st.slider("FPS (higher = smoother, heavier)", 2, 20, 10)
     wind = st.slider("Wind (left ↔ right)", -10, 10, 2)
+    speed_mult = st.slider("Fall speed multiplier", 1.0, 5.0, 2.5, 0.1)
     seed = st.number_input("Seed", 0, 9999, 7)
 
     colA, colB = st.columns(2)
@@ -246,25 +240,16 @@ except Exception as e:
 
 x_min, x_max, y_min, y_max, grid_x, grid_y, grid_z, points, values = precompute_grid(df, nx, ny)
 
-# ----------------------------
-# Render (static or animated)
-# ----------------------------
-plot_area = st.empty()
+# Draw base figure ONCE (major speed improvement)
+fig, ax, clip_patch, contour = build_base_figure(gdf, grid_x, grid_y, grid_z)
 
-if not snow_on or snow_density == 0:
-    # just draw base map
-    fig, ax, patch = build_base_figure(gdf, grid_x, grid_y, grid_z, x_min, x_max, y_min, y_max)
-    plot_area.pyplot(fig, use_container_width=True)
-    st.session_state.running = False
-else:
-    # Prepare flakes ONCE per run (so they move smoothly)
-    # Re-generate when seed/density changes.
+# Prepare flakes (regenerate when parameters change)
+if snow_on and snow_density > 0:
     key = (snow_density, seed, nx, ny)
     if "flake_key" not in st.session_state or st.session_state.flake_key != key:
         st.session_state.flake_key = key
         fx, fy, sizes, speed, alphas = generate_weighted_flakes(
-            points, values, x_min, x_max, y_min, y_max,
-            n_flakes=snow_density, seed=seed
+            points, values, x_min, x_max, y_min, y_max, n_flakes=snow_density, seed=seed
         )
         st.session_state.fx = fx
         st.session_state.fy = fy
@@ -272,10 +257,27 @@ else:
         st.session_state.speed = speed
         st.session_state.alphas = alphas
 
-    # draw one frame (even if not running)
-    def draw_frame():
-        fig, ax, clip_patch = build_base_figure(gdf, grid_x, grid_y, grid_z, x_min, x_max, y_min, y_max)
+# Container for frames
+plot_area = st.empty()
 
+
+def clear_previous_snow(ax_):
+    # Remove only scatter collections that were added after the contourf.
+    # contourf creates multiple collections; we keep them all and remove only the last scatter.
+    # Safest: remove all PathCollection objects (scatter) by checking for attribute "get_offsets".
+    keep = []
+    for coll in ax_.collections:
+        # contourf collections don't have get_offsets, scatter does
+        if hasattr(coll, "get_offsets"):
+            continue
+        keep.append(coll)
+    ax_.collections = keep
+
+
+def draw_frame():
+    clear_previous_snow(ax)
+
+    if snow_on and snow_density > 0:
         fx = st.session_state.fx
         fy = st.session_state.fy
         sizes = st.session_state.sizes
@@ -295,36 +297,36 @@ else:
         )
         snow.set_clip_path(clip_patch)
 
-        plot_area.pyplot(fig, use_container_width=True)
+    plot_area.pyplot(fig, use_container_width=True)
 
-    # If not running, show one frame
-    if not st.session_state.running:
+
+# Static frame if not running
+if not snow_on or snow_density == 0:
+    draw_frame()
+    st.session_state.running = False
+
+elif not st.session_state.running:
+    draw_frame()
+
+else:
+    dt = 1.0 / fps
+    for _ in range(5000):  # safety cap
+        if not st.session_state.running:
+            break
+
+        # Update snow positions (faster with multiplier)
+        fy = st.session_state.fy - (st.session_state.speed * speed_mult)
+        fx = st.session_state.fx + (wind * 0.004 * speed_mult)
+
+        # wrap around
+        fy = np.where(fy < y_min, y_max, fy)
+        fx = np.where(fx < x_min, x_max, fx)
+        fx = np.where(fx > x_max, x_min, fx)
+
+        st.session_state.fx = fx
+        st.session_state.fy = fy
+
         draw_frame()
-    else:
-        # Animate loop (will run until Stop pressed)
-        dt = 1.0 / fps
-        for _ in range(5000):  # safety cap
-            if not st.session_state.running:
-                break
+        time.sleep(dt)
 
-            # update flake positions
-            fx = st.session_state.fx
-            fy = st.session_state.fy
-            sp = st.session_state.speed
-
-            # fall + wind (wind scaled down)
-            fy = fy - sp
-            fx = fx + (wind * 0.005) * sp
-
-            # wrap around
-            fy = np.where(fy < y_min, y_max, fy)
-            fx = np.where(fx < x_min, x_max, fx)
-            fx = np.where(fx > x_max, x_min, fx)
-
-            st.session_state.fx = fx
-            st.session_state.fy = fy
-
-            draw_frame()
-            time.sleep(dt)
-
-        st.session_state.running = False
+    st.session_state.running = False
