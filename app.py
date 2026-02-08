@@ -1,4 +1,5 @@
 import os
+import time
 import streamlit as st
 
 import pandas as pd
@@ -51,15 +52,9 @@ def load_states() -> gpd.GeoDataFrame:
     return gdf
 
 
-def make_figure(
-    df: pd.DataFrame,
-    gdf: gpd.GeoDataFrame,
-    nx: int = 1000,
-    ny: int = 600,
-    snow_density: int = 0,
-    snow_seed: int = 7
-):
-    # --- Interpolation (Clean) ---
+@st.cache_data
+def precompute_grid(df: pd.DataFrame, nx: int, ny: int):
+    # bbox
     x_min, x_max = -126, -66
     y_min, y_max = 24, 50
 
@@ -70,30 +65,23 @@ def make_figure(
 
     points = df[['longitude', 'latitude']].values
     values = df['prob_snow'].values
-    grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
 
-    # --- Plotting ---
+    grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
+    return (x_min, x_max, y_min, y_max, grid_x, grid_y, grid_z, points, values)
+
+
+def build_base_figure(gdf: gpd.GeoDataFrame, grid_x, grid_y, grid_z, x_min, x_max, y_min, y_max):
     fig, ax = plt.subplots(figsize=(20, 12))
     plt.subplots_adjust(top=0.85)
 
-    # Discrete Levels
     levels = [0, 10, 25, 40, 50, 60, 75, 90, 100]
-
-    # Colors (your exact palette)
     color_list = [
-        '#4f4f4d',
-        '#6e7b8e',
-        '#6080a8',
-        '#6c97c4',
-        '#82acd0',
-        '#a1bddc',
-        '#c5d0db',
-        '#eeeeee'
+        '#4f4f4d', '#6e7b8e', '#6080a8', '#6c97c4',
+        '#82acd0', '#a1bddc', '#c5d0db', '#eeeeee'
     ]
     custom_cmap = mcolors.ListedColormap(color_list)
     norm = mcolors.BoundaryNorm(levels, custom_cmap.N)
 
-    # Plot Heatmap
     contour = ax.contourf(
         grid_x, grid_y, grid_z,
         levels=levels, cmap=custom_cmap, norm=norm,
@@ -107,67 +95,10 @@ def make_figure(
     patch = PathPatch(path, transform=ax.transData, facecolor='none')
     contour.set_clip_path(patch)
 
-    # ----------------------------
-    # NEW: Weighted snow overlay (A2)
-    # ----------------------------
-    if snow_density > 0:
-        rng = np.random.default_rng(snow_seed)
-
-        # Generate candidate flakes (more candidates -> smoother probability weighting)
-        candidates = int(snow_density * 6)
-
-        xs = rng.uniform(x_min, x_max, size=candidates)
-        ys = rng.uniform(y_min, y_max, size=candidates)
-
-        # Evaluate probability at candidate points (same interpolation engine)
-        probs = griddata(points, values, (xs, ys), method='linear')
-
-        # Handle NaNs (outside convex hull). Fill using nearest.
-        nan_mask = np.isnan(probs)
-        if np.any(nan_mask):
-            probs_nearest = griddata(points, values, (xs[nan_mask], ys[nan_mask]), method='nearest')
-            probs[nan_mask] = probs_nearest
-
-        # Convert to [0,1] acceptance probability
-        accept_p = np.clip(probs, 0, 100) / 100.0
-
-        # Sample flakes (weighted)
-        keep = rng.random(candidates) < accept_p
-
-        fx = xs[keep]
-        fy = ys[keep]
-
-        # Optionally cap so it never gets crazy heavy
-        # (keeps Streamlit fast)
-        max_flakes = int(snow_density * 1.6)
-        if fx.size > max_flakes:
-            idx = rng.choice(fx.size, size=max_flakes, replace=False)
-            fx, fy = fx[idx], fy[idx]
-
-        # Random sizes + slight alpha variation
-        sizes = rng.uniform(3, 18, size=fx.size)
-        alphas = rng.uniform(0.15, 0.55, size=fx.size)
-
-        # Matplotlib doesn't allow per-point alpha directly in scatter easily,
-        # so we embed alpha in RGBA colors.
-        colors = np.ones((fx.size, 4))
-        colors[:, :3] = 1.0  # white
-        colors[:, 3] = alphas
-
-        snow = ax.scatter(
-            fx, fy,
-            s=sizes,
-            c=colors,
-            marker='o',
-            linewidths=0,
-            zorder=3
-        )
-        snow.set_clip_path(patch)
-
-    # Draw State Lines
+    # state lines
     gdf.boundary.plot(ax=ax, color='black', linewidth=0.8, alpha=0.6, zorder=4)
 
-    # Labels
+    # labels
     state_map = {
         'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
         'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'Florida': 'FL', 'Georgia': 'GA',
@@ -180,16 +111,14 @@ def make_figure(
         'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT', 'Vermont': 'VT',
         'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV', 'Wisconsin': 'WI', 'Wyoming': 'WY'
     }
-
     gdf2 = gdf.copy()
     gdf2['short_name'] = gdf2['name'].map(state_map)
-
     for _, row in gdf2.iterrows():
         if pd.notnull(row['short_name']):
-            centroid = row.geometry.representative_point()
+            p = row.geometry.representative_point()
             ax.annotate(
                 text=row['short_name'],
-                xy=(centroid.x, centroid.y),
+                xy=(p.x, p.y),
                 ha='center', va='center',
                 color='white', fontsize=9, weight='bold',
                 alpha=0.65,
@@ -197,7 +126,6 @@ def make_figure(
                 zorder=5
             )
 
-    # Disclaimer
     ax.text(
         x=-120, y=25,
         s="Probabilities for Alaska and\nHawaii not available",
@@ -205,7 +133,6 @@ def make_figure(
         zorder=6
     )
 
-    # Title + Top colorbar
     plt.axis('off')
     fig.text(
         0.5, 0.92,
@@ -217,7 +144,44 @@ def make_figure(
     cbar = fig.colorbar(contour, cax=cbar_ax, orientation='horizontal', ticks=levels)
     cbar.ax.tick_params(labelsize=10)
 
-    return fig
+    return fig, ax, patch
+
+
+def generate_weighted_flakes(points, values, x_min, x_max, y_min, y_max, n_flakes, seed):
+    """
+    Create initial flake positions weighted by probability.
+    """
+    rng = np.random.default_rng(seed)
+    candidates = int(n_flakes * 6)
+
+    xs = rng.uniform(x_min, x_max, size=candidates)
+    ys = rng.uniform(y_min, y_max, size=candidates)
+
+    probs = griddata(points, values, (xs, ys), method='linear')
+
+    nan_mask = np.isnan(probs)
+    if np.any(nan_mask):
+        probs[nan_mask] = griddata(points, values, (xs[nan_mask], ys[nan_mask]), method='nearest')
+
+    accept_p = np.clip(probs, 0, 100) / 100.0
+    keep = rng.random(candidates) < accept_p
+
+    fx = xs[keep]
+    fy = ys[keep]
+
+    # cap to n_flakes
+    if fx.size > n_flakes:
+        idx = rng.choice(fx.size, size=n_flakes, replace=False)
+        fx, fy = fx[idx], fy[idx]
+
+    # sizes + speed per flake (bigger flakes fall faster)
+    sizes = rng.uniform(3, 18, size=fx.size)
+    speed = rng.uniform(0.03, 0.12, size=fx.size) * (sizes / sizes.max())
+
+    # alpha per flake
+    alphas = rng.uniform(0.15, 0.60, size=fx.size)
+
+    return fx, fy, sizes, speed, alphas
 
 
 # ----------------------------
@@ -226,7 +190,7 @@ def make_figure(
 with st.sidebar:
     st.header("Inputs")
     excel_filename = st.text_input(
-        "Excel filename (in repo root)",
+        "Excel filename (repo root)",
         value="Christmas_day_snow_statistics_1991-2020_updated.xlsx"
     )
 
@@ -238,22 +202,37 @@ with st.sidebar:
     else:
         nx, ny = 1000, 600
 
-    st.header("Snow effect (A2)")
-    snow_density = st.slider("Snow density", 0, 2500, 600, step=50)
-    snow_seed = st.number_input("Snow pattern seed", min_value=0, max_value=9999, value=7, step=1)
+    st.header("Animated snow")
+    snow_on = st.checkbox("Enable animation", value=True)
+    snow_density = st.slider("Snow density", 0, 2000, 700, step=50)
+    fps = st.slider("FPS (higher = smoother, heavier)", 2, 20, 10)
+    wind = st.slider("Wind (left ↔ right)", -10, 10, 2)
+    seed = st.number_input("Seed", 0, 9999, 7)
+
+    colA, colB = st.columns(2)
+    start_btn = colA.button("▶ Start")
+    stop_btn = colB.button("⏹ Stop")
 
 
 # ----------------------------
-# Load and render
+# Session state for animation
+# ----------------------------
+if "running" not in st.session_state:
+    st.session_state.running = False
+
+if start_btn:
+    st.session_state.running = True
+if stop_btn:
+    st.session_state.running = False
+
+
+# ----------------------------
+# Load data
 # ----------------------------
 try:
     df = load_data(excel_filename)
 except FileNotFoundError:
-    st.error(
-        f"Couldn't find **{excel_filename}** in your repo.\n\n"
-        "✅ Fix: upload the Excel to the repo root (same folder as app.py), "
-        "or change the filename in the sidebar to match exactly."
-    )
+    st.error(f"Couldn't find **{excel_filename}** in the repo root.")
     st.stop()
 except Exception as e:
     st.error(f"Excel load failed: {e}")
@@ -265,5 +244,87 @@ except Exception as e:
     st.error(f"Map load failed: {e}")
     st.stop()
 
-fig = make_figure(df, gdf, nx=nx, ny=ny, snow_density=snow_density, snow_seed=snow_seed)
-st.pyplot(fig, use_container_width=True)
+x_min, x_max, y_min, y_max, grid_x, grid_y, grid_z, points, values = precompute_grid(df, nx, ny)
+
+# ----------------------------
+# Render (static or animated)
+# ----------------------------
+plot_area = st.empty()
+
+if not snow_on or snow_density == 0:
+    # just draw base map
+    fig, ax, patch = build_base_figure(gdf, grid_x, grid_y, grid_z, x_min, x_max, y_min, y_max)
+    plot_area.pyplot(fig, use_container_width=True)
+    st.session_state.running = False
+else:
+    # Prepare flakes ONCE per run (so they move smoothly)
+    # Re-generate when seed/density changes.
+    key = (snow_density, seed, nx, ny)
+    if "flake_key" not in st.session_state or st.session_state.flake_key != key:
+        st.session_state.flake_key = key
+        fx, fy, sizes, speed, alphas = generate_weighted_flakes(
+            points, values, x_min, x_max, y_min, y_max,
+            n_flakes=snow_density, seed=seed
+        )
+        st.session_state.fx = fx
+        st.session_state.fy = fy
+        st.session_state.sizes = sizes
+        st.session_state.speed = speed
+        st.session_state.alphas = alphas
+
+    # draw one frame (even if not running)
+    def draw_frame():
+        fig, ax, clip_patch = build_base_figure(gdf, grid_x, grid_y, grid_z, x_min, x_max, y_min, y_max)
+
+        fx = st.session_state.fx
+        fy = st.session_state.fy
+        sizes = st.session_state.sizes
+        alphas = st.session_state.alphas
+
+        colors = np.ones((fx.size, 4))
+        colors[:, :3] = 1.0
+        colors[:, 3] = alphas
+
+        snow = ax.scatter(
+            fx, fy,
+            s=sizes,
+            c=colors,
+            marker='o',
+            linewidths=0,
+            zorder=10
+        )
+        snow.set_clip_path(clip_patch)
+
+        plot_area.pyplot(fig, use_container_width=True)
+
+    # If not running, show one frame
+    if not st.session_state.running:
+        draw_frame()
+    else:
+        # Animate loop (will run until Stop pressed)
+        dt = 1.0 / fps
+        for _ in range(5000):  # safety cap
+            if not st.session_state.running:
+                break
+
+            # update flake positions
+            fx = st.session_state.fx
+            fy = st.session_state.fy
+            sp = st.session_state.speed
+
+            # fall + wind (wind scaled down)
+            fy = fy - sp
+            fx = fx + (wind * 0.005) * sp
+
+            # wrap around
+            fy = np.where(fy < y_min, y_max, fy)
+            fx = np.where(fx < x_min, x_max, fx)
+            fx = np.where(fx > x_max, x_min, fx)
+
+            st.session_state.fx = fx
+            st.session_state.fy = fy
+
+            draw_frame()
+            time.sleep(dt)
+
+        st.session_state.running = False
